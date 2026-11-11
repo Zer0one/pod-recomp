@@ -12,6 +12,14 @@ controls and listening, general mouse/menu navigation, extended play, Finder
 setup and a clean-machine run. The upstream host tasks below retain their
 own scope; Linux and Libretro ports have not been started.
 
+The [alternate renderer assessment](docs/ACCELERATED_RENDERERS.md) starts an
+isolated Glide-build probe in this fork. It now renders the car menu and a bounded race scene through a native Metal
+pipeline. Visual fidelity and full gameplay remain unqualified; Direct3D remains
+comparative analysis. A POD-specific lifecycle service now orders renderer,
+audio and graphics teardown: race WM_CLOSE and Quit Game / Yes complete through
+the original ExitProcess(0), including effects/CD runs. These bounded checks
+do not qualify extended gameplay or safe shared-library unload. This fork work is separate from the upstream renderer scope below.
+
 ## Next
 
 - **Score a race of your own in conformance.** It plays (v0.1.0, by hand-written `--key`

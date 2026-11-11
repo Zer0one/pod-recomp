@@ -7,6 +7,12 @@
 #include "codec.h"
 #include "video_present.h"
 static uint32_t profile_string,ddraw_base;
+static uint32_t device_caps_base;
+static unsigned desktop_bits;
+static void device_caps(void) {
+    if (A32(1)==12) RET(desktop_bits,2); /* BITSPIXEL, not the host's display */
+    recomp_lookup_import(device_caps_base)();
+}
 /* The data folder stands for the CD; the writable overlay holds Ubi.ini
  * and saves. This is POD's existing host policy, without a real drive mount. */
 static void windows_dir(void) {
@@ -141,12 +147,23 @@ static const win32hle_shim shims[]={
     {"IsIconic",is_iconic},{"OpenIcon",open_icon},
     {NULL,NULL}
 };
-void pod_compat_register(int videos) {
+void pod_compat_register(int videos, unsigned bits) {
+    desktop_bits=bits;
+    if (desktop_bits) {
+        static const win32hle_shim display[]={{"GetDeviceCaps",device_caps},{NULL,NULL}};
+        win32hle_register(display);
+    }
     if (videos) win32hle_register(pod_video_shims);
     win32hle_register(shims);
     win32hle_register(pod_draw_shims);
 }
 void pod_compat_bind(void) {
+    if (desktop_bits) for (const win32hle_shim *s=win32hle_gdi32;s->name;s++)
+        if (!strcmp(s->name,"GetDeviceCaps")) {
+            static win32hle_shim original[2];
+            original[0].name="POD::DeviceCapsBase"; original[0].fn=s->fn;
+            win32hle_register(original); device_caps_base=hle_resolve(original[0].name);
+        }
     for (const win32hle_shim *s=win32hle_ddraw;s->name;s++)
         if (!strcmp(s->name,"DirectDrawCreate")) {
             static win32hle_shim original[2];

@@ -148,7 +148,11 @@ class Out:
             self.lines = 0
 
 
-def lift(path, catalog, md, out):
+def lift(path, catalog, md, out, patches=None):
+    # Other renderer executables have different addresses. Their isolated
+    # bring-up may reuse the lifting machinery without PODMMX's CPU patches.
+    if patches is None:
+        patches = PATCHES
     info = analyze_pe(path)
     iat = build_iat_map(info)
     cs, ce = info.code_start, info.code_end
@@ -193,7 +197,7 @@ def lift(path, catalog, md, out):
                     leaders.add(addr)
                 body = (lift_function_linear(lifter, name, insns, leaders, addr) if insns
                         else 'void %s(void) { }\n' % name)
-                body = apply_patches(body, PATCHES)
+                body = apply_patches(body, patches)
             except Exception as e:                  # noqa: BLE001 -- counted, not hidden
                 body = '/* ERROR %s: %s */\nvoid %s(void) { }\n' % (name, e, name)
                 stats['errors'] += 1

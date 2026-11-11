@@ -41,9 +41,15 @@ separately. A relocatable package is a further check beyond a local build.
 | `pcm_output.h` | Exact-format queue ownership and consumption contract | No SDL or guest callbacks |
 | `pcm_sdl.c` / `pod_pcm_sdl` | Independent SDL output queues | Standalone frontend backend |
 | `input_sdl.c` | SDL scancode to DIK translation | Standalone input adapter |
+| `glide_bootstrap.c` | Experimental Glide guest ABI, TMU/palette/LFB ownership and state | HLE globals and current GDI presentation hook |
+| `glide_compat.c` / `pod_glide_compat` | PODX3DFX-specific renderer quiescence, semaphore/audio ordering, deferred graphics shutdown, WM_CLOSE publication order and virtual cursor-query policy | Guest HLE ABI; no OS, CLI, window ownership or process-exit policy |
+| `glide_texture.c` | Texture format conversion, mip layout and aspect coordinate scale | Native C data only |
+| `glide_vertex.c` | Active-attribute decoding, default shared FBI/TMU reciprocal W | Native C data only |
+| `glide_gpu.h` | Concrete offscreen GPU resource/draw contract | No guest pointers, SDL windows or Metal types |
+| `src/macos/glide_metal.m`, `glide_shader.metal` | Metal buffers, texture upload, draw batches and shader | macOS-only optional backend |
 | `host.c` | CLI, paths, SDL/Cocoa lifecycle, scripts, watchdog, captures, worker startup | Standalone application only |
 
-`pod_compat_register(videos)` registers POD overrides before
+`pod_compat_register(videos, desktop_bits)` registers POD overrides before
 `recomp_host_init()`. `pod_compat_bind()` then resolves the original HLE
 delegates. This preserves the override ordering used by the native port.
 The library intentionally does not own application shutdown or process exit.
@@ -134,3 +140,29 @@ selects an SDL presenter without a second physical VSync wait; its window does
 not define guest simulation time. A future pull-driven frontend must replace
 this blocking scheduling contract deliberately, alongside the existing guest
 thread/lifecycle limitations, rather than reusing it inside `retro_run`.
+
+## Experimental accelerated path
+
+Only the separate Glide guest target links the GPU backend. The default MMX
+software standalone retains its HLE rendering path and build dependencies.
+The Glide service owns copied vertex/state/texture data; GPU command buffers
+retain native resources through completion. Front/back color buffers are
+independent, and readback/upload/swap complete queued draws before CPU access.
+Guest LFB addresses and guest presentation storage are cleared from HLE before
+freeing them. Backend state contains no guest address or window handle.
+
+This boundary prepares another native backend; it does not establish Linux
+support. The current Glide service still uses a process-global session, the
+HLE GDI window hook, and a wall-clock swap wait that yields the machine lock.
+A pull-driven frontend must replace that scheduling and presentation ownership.
+Readback per swap is a correctness-first development path, not a zero-copy
+Metal presenter or a Libretro hardware-render interface.
+
+
+POD Glide's shutdown policy is deliberately outside the reusable Glide service
+and Metal backend. The standalone registers/binds `pod_glide_compat` but does
+not implement its guest semaphore or message policy. The service lets the
+original game cleanup stop its renderer and acknowledge audio, then honors the
+final graphics shutdown. This repairs the tested standalone exit routes; it
+does not replace guest threads with a pull-driven frontend or make the current
+global runtime safe to unload/reinitialize as a Libretro core.

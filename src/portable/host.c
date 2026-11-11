@@ -21,6 +21,16 @@
 #include "cd_audio.h"
 #include "compat.h"
 #include "input_sdl.h"
+#ifdef POD_GLIDE_BOOTSTRAP
+#include "glide_bootstrap.h"
+#include "glide_compat.h"
+#endif
+#ifndef POD_GUEST_IMAGE
+#define POD_GUEST_IMAGE "PODMMX.EXE"
+#endif
+#ifndef POD_GUEST_DESKTOP_BPP
+#define POD_GUEST_DESKTOP_BPP 0
+#endif
 
 static int headless, in_pump, videos, window_log;
 static uint32_t close_requested;
@@ -295,7 +305,7 @@ int main(int argc,char **argv) {
         snprintf(cd_absolute,sizeof cd_absolute,"%s%s%s",cd_capture[0]=='/'?"":cwd,cd_capture[0]=='/'?"":"/",cd_capture);
         cd_capture=cd_absolute;
     }
-    snprintf(image,sizeof image,"%s/PODMMX.EXE",game_path);
+    snprintf(image,sizeof image,"%s/" POD_GUEST_IMAGE,game_path);
     if (codec_probe || videos) {
         char codec_path[PATH_MAX];
         snprintf(codec_path,sizeof codec_path,"%s/INSTALL/IR41_32.DLL",game_path);
@@ -304,15 +314,24 @@ int main(int argc,char **argv) {
     hle_set_drive('C',game_path); hle_set_drive('D',game_path);
     hle_set_overlay(game_path,state_path);
     hle_set_module_path(image);
-    hle_set_command_line("\"C:\\PODMMX.EXE\"");
-    pod_compat_register(videos);
+    hle_set_command_line("\"C:\\" POD_GUEST_IMAGE "\"");
+    pod_compat_register(videos,POD_GUEST_DESKTOP_BPP);
     win32hle_register(pod_dinput_shims);
     win32hle_register(pod_audio_shims);
     win32hle_register(pod_cd_shims);
+#ifdef POD_GLIDE_BOOTSTRAP
+    pod_glide_compat_register();
+    win32hle_register(pod_glide_bootstrap_shims);
+#endif
     recomp_host_init();
     pod_compat_bind();
+#ifdef POD_GLIDE_BOOTSTRAP
+    pod_glide_compat_bind();
+#endif
     if (recomp_host_boot_permissive(image)) return 1;
     fprintf(stderr,"[pod] native host; videos=%s; PCM effects via SDL; state=%s\n",videos?"experimental IV41 + SDL-converted audio":"skipped",state_path);
+    if (strcmp(POD_GUEST_IMAGE,"PODMMX.EXE"))
+        fprintf(stderr,"[pod] alternate executable probe: %s; experimental renderer, fidelity unqualified\n",POD_GUEST_IMAGE);
     if (codec_probe) {
         if (watchdog_seconds) { pthread_t t; if (pthread_create(&t,NULL,watchdog,NULL)) return 1; pthread_detach(t); }
         return decode_input?pod_codec_decode(decode_input,decode_output,decode_first):pod_codec_probe();
