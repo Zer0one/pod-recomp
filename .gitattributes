@@ -1,0 +1,2 @@
+# Unified diff context for an empty source line contains one space.
+tools/macos/patches/*.patch whitespace=-blank-at-eol

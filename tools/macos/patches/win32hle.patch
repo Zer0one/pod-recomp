@@ -1,0 +1,681 @@
+--- a/runtime/recomp32/recomp_types.h
++++ b/runtime/recomp32/recomp_types.h
+@@ -28,7 +28,14 @@
+ static inline uint64_t __rdtsc(void) {
+     struct timespec ts;
+     clock_gettime(CLOCK_MONOTONIC, &ts);
+-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++    uint64_t ns = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++#ifdef RECOMP_CPUID_PENTIUM_MMX
++    /* Keep the virtual counter consistent with the advertised Pentium MMX.
++     * POD calibrates it and only accepts 40--600 MHz. */
++    return ns / 5u; /* 200 MHz */
++#else
++    return ns;
++#endif
+ }
+ #endif
+ 
+@@ -1083,6 +1090,17 @@
+     if (eax_val == 1) { g_edx &= g_cpuid_edx1; g_ecx &= g_cpuid_ecx1; }
+     if (eax_val == 0x80000001u) g_edx &= g_cpuid_edx_ext;
+     (void)ebx_val; (void)edx_val;
++#elif defined(RECOMP_CPUID_PENTIUM_MMX)
++    /* A guest CPU profile, not the host CPU. POD's lift already identifies
++     * this processor; its separate MMX probe needs the feature bits too. */
++    g_eax = g_ebx = g_ecx = g_edx = 0;
++    if (eax_val == 0) {
++        g_eax = 1; g_ebx = 0x756E6547u; g_edx = 0x49656E69u; g_ecx = 0x6C65746Eu;
++    } else if (eax_val == 1) {
++        g_eax = 0x00000543u;
++        g_edx = (1u | (1u << 4) | (1u << 8) | (1u << 23)) & g_cpuid_edx1;
++    }
++    (void)ebx_val; (void)ecx_val; (void)edx_val;
+ #else
+     (void)eax_val; (void)ebx_val; (void)ecx_val; (void)edx_val;
+ #endif
+--- a/runtime/win32hle/ddraw.c
++++ b/runtime/win32hle/ddraw.c
+@@ -138,7 +138,10 @@
+     surf_t *s = (surf_t *)hle_alloc(sizeof *s);
+     s->w = w, s->h = h, s->bpp = bpp, s->caps = caps, s->primary = primary;
+     s->pitch = ((w * (bpp / 8)) + 3) & ~3;
+-    s->px = s->own_px = (uint8_t *)hle_alloc((uint32_t)s->pitch * (uint32_t)h + SURF_TAIL);
++    /* POD's original blitter writes one pixel before the locked surface.
++     * Keep that write out of the guest heap header, like POD's Windows host. */
++    s->own_px = (uint8_t *)hle_alloc((uint32_t)s->pitch * (uint32_t)h + SURF_TAIL + 4096);
++    s->px = s->own_px ? s->own_px + 4096 : NULL;
+     if (!s->px) hle_fatal("no guest memory for a %dx%d surface", w, h);
+     masks(bpp, &s->rmask, &s->gmask, &s->bmask);
+     uint32_t o = hle_com_new(g_vt_surf, 12);
+@@ -295,10 +298,24 @@
+ static void dd_GetVerticalBlankStatus(void) { if (A32(1)) MEM32(A32(1)) = (hle_ticks_ms() % 16) == 0; RET(DD_OK, 2); }
+ static void dd_Initialize(void) { RET(DD_OK, 2); }
+ static void dd_RestoreDisplayMode(void) { RET(DD_OK, 1); }
+-static void dd_SetCooperativeLevel(void) { if (trace()) fprintf(stderr, "[ddraw] SetCooperativeLevel(0x%X)\n", A32(2)); RET(DD_OK, 3); }
++static uint32_t g_coop_window,g_coop_flags;
++static void fit_fullscreen_window(void) {
++    /* DDSCL_FULLSCREEN resizes the virtual top-level window with the mode,
++     * unless the application explicitly owns window changes. */
++    if (g_coop_window && (g_coop_flags&1u) && !(g_coop_flags&4u)) {
++        uint32_t a[7]={g_coop_window,0,0,0,(uint32_t)g_mode_w,(uint32_t)g_mode_h,0x14};
++        hle_call_guest(hle_resolve("SetWindowPos"),7,a);
++    }
++}
++static void dd_SetCooperativeLevel(void) {
++    g_coop_window=A32(1); g_coop_flags=A32(2);
++    if (trace()) fprintf(stderr,"[ddraw] SetCooperativeLevel(0x%X)\n",g_coop_flags);
++    fit_fullscreen_window(); RET(DD_OK,3);
++}
+ static void set_mode(int w, int h, int bpp) {
+     g_mode_w = w, g_mode_h = h, g_mode_bpp = bpp, g_mode_set = 1;
+     hle_set_screen_size(w, h);
++    fit_fullscreen_window();
+     fprintf(stderr, "[ddraw] SetDisplayMode(%dx%dx%d)\n", w, h, bpp);
+ }
+ static void dd_SetDisplayMode(void)  { set_mode((int)A32(1), (int)A32(2), (int)A32(3)); RET(DD_OK, 4); }
+@@ -376,6 +393,9 @@
+     g_frame_seq++;
+     if (hle_dd_primary_hook) hle_dd_primary_hook();
+ }
++
++/* A host drew into the primary through another API (for example VfW/GDI). */
++void hle_dd_primary_touched(void) { if (g_primary) mark(g_primary); }
+ 
+ /* The copy: same format at both ends (DirectDraw does not convert either),
+  * clipped to both surfaces, stretched nearest-neighbour when the sizes
+@@ -482,6 +502,31 @@
+ static void sf_Flip(void) {                              /* (this, target, flags): swap front and back pixels */
+     surf_t *s = S(A32(0));
+     if (s->back) {
++        /* POD uses Flip(flags=0) as its display synchronization point.
++         * An SDL presenter can hide an immediate-flip bug through vsync,
++         * but headless runs have no presenter. Keep guest display timing
++         * in DirectDraw, independent of host refresh rate.
++         * https://learn.microsoft.com/en-us/windows/win32/api/ddraw/nf-ddraw-idirectdrawsurface7-flip
++         * This synchronous HLE exposes no FLIPNOVSYNC/FLIPINTERVAL caps. */
++        static uint64_t next_flip;
++        struct timespec ts;
++        clock_gettime(CLOCK_MONOTONIC, &ts);
++        uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
++        const uint64_t period = 1000000000ull / 60;
++        if (!next_flip || now > next_flip + period) next_flip = now;
++        next_flip += period;
++        uint64_t due = next_flip;
++        hle_block_begin();
++        do {
++            uint64_t wait = due > now ? due - now : 0;
++            if (!wait) break;
++            ts.tv_sec = wait / 1000000000ull;
++            ts.tv_nsec = wait % 1000000000ull;
++            nanosleep(&ts, NULL);
++            clock_gettime(CLOCK_MONOTONIC, &ts);
++            now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
++        } while (now < due);
++        hle_block_end();
+         uint8_t *t = s->px;
+         s->px = s->back->px, s->back->px = t;
+         mark(s);
+--- a/runtime/win32hle/host_lite.c
++++ b/runtime/win32hle/host_lite.c
+@@ -156,6 +156,9 @@
+     for (int spins = 0; g_waiters && g_owner_gen == g_block_gen && spins < 1000; spins++) sched_yield();
+     mach_take();
+     regs_load(&g_ms.r);
++    /* A blocking import (GetMessage, a wait) may never return on its own.
++     * Observe suspension/termination as soon as it reacquires the machine. */
++    hle_thread_checkpoint();
+ }
+ 
+ /* Let a waiting thread have the machine, if there is one. The mutex is not
+@@ -220,7 +223,8 @@
+  * thread that holds the machine, so the index passes through a global. */
+ static volatile uint32_t g_pending_shim;
+ static void shim_entry(void) {
+-    uint32_t i = g_pending_shim;
++    uint32_t i = g_pending_shim; /* capture before a suspend checkpoint can yield */
++    hle_thread_checkpoint();
+     if (g_waiters) hle_yield();
+     g_last_import_va = g_shim[i].va;                     /* again: the thread that ran meanwhile set its own */
+     g_cur_import = g_shim[i].name;
+@@ -281,7 +285,7 @@
+ }
+ 
+ /* Loops in lifted code hand the machine over too (RECOMP_BACKEDGE). */
+-static void yield_hook(void) { hle_yield(); }
++static void yield_hook(void) { hle_thread_checkpoint(); hle_yield(); }
+ __attribute__((constructor)) static void install_yield_hook(void) { recomp_yield_hook = yield_hook; }
+ 
+ /* ---------------------------------------------------------- handles
+--- a/runtime/win32hle/kernel32_crt.c
++++ b/runtime/win32hle/kernel32_crt.c
+@@ -32,12 +32,13 @@
+ /* A thread's handle object: how many ResumeThreads it still waits for
+  * (CREATE_SUSPENDED), and once it has ended, its exit code, so a wait on the
+  * handle returns. Never freed: CloseHandle can come while it still runs. */
+-struct thread_arg { uint32_t start, param, tid; volatile int suspend, done; uint32_t code; };
++struct thread_arg { uint32_t start, param, tid; volatile int suspend, done, stop; uint32_t code; };
+ static __thread struct thread_arg *t_self;
+ static void *thread_trampoline(void *p) {
+     struct thread_arg *a = (struct thread_arg *)p;
+     hle_thread_id_adopt(a->tid);                     /* the id CreateThread gave out (PostThreadMessageA) */
+-    while (a->suspend > 0) usleep(1000);
++    while (a->suspend > 0 && !a->stop) usleep(1000);
++    if (a->stop) { a->done = 1; return NULL; }
+     t_self = a;
+     uint32_t args[1] = { a->param };
+     a->code = hle_call_guest(a->start, 1, args);
+@@ -50,7 +51,19 @@
+     a->tid = hle_thread_id_new();
+     uint32_t h = hle_handle_alloc(HLE_H_THREAD, a);
+     pthread_t t;
+-    if (!h || pthread_create(&t, NULL, thread_trampoline, a) != 0) { if (h) hle_handle_close(h); free(a); RET(0, 6); }
++    pthread_attr_t attr;
++    int error = pthread_attr_init(&attr);
++    if (!error) {
++#ifdef __APPLE__
++        /* Lifted assembly continuation chains consume host C stack. The
++         * macOS pthread default (512 KiB) overflows decoding a 640x480 frame;
++         * match the 8 MiB main stack used by the offline decoder. */
++        error = pthread_attr_setstacksize(&attr, 8u * 1024u * 1024u);
++#endif
++        if (!error && h) error = pthread_create(&t, &attr, thread_trampoline, a);
++        pthread_attr_destroy(&attr);
++    }
++    if (!h || error) { if (h) hle_handle_close(h); free(a); RET(0, 6); }
+     pthread_detach(t);
+     uint32_t ptid = A32(5); if (ptid) MEM32(ptid) = a->tid;
+     RET(h, 6);
+@@ -68,6 +81,39 @@
+     if (t_self) t_self->code = A32(0), t_self->done = 1;
+     hle_block_begin();
+     pthread_exit(NULL);
++}
++/* Cooperative termination at the HLE's import/back-edge safe points.
++ * Never pthread_cancel a thread while it owns the shared guest machine. */
++void hle_thread_checkpoint(void) {
++    static __thread int active;
++    if (!t_self || active) return;
++    active = 1;
++    while (t_self && t_self->suspend > 0 && !t_self->stop) {
++        hle_block_begin(); usleep(1000); hle_block_end();
++    }
++    if (t_self && t_self->stop) {
++        t_self->done = 1;
++        hle_block_begin();
++        pthread_exit(NULL);
++    }
++    active = 0;
++}
++static void k_SuspendThread(void) {
++    struct thread_arg *a = (struct thread_arg *)hle_handle_obj(A32(0), HLE_H_THREAD);
++    if (!a || a->done) { hle_set_last_error(6); RET(0xFFFFFFFFu, 1); }
++    int previous = a->suspend++;
++    RET((uint32_t)previous, 1);
++}
++static void k_TerminateThread(void) {
++    struct thread_arg *a = (struct thread_arg *)hle_handle_obj(A32(0), HLE_H_THREAD);
++    if (!a) { hle_set_last_error(6); RET(0, 2); }
++    a->code = A32(1);
++    a->stop = 1;
++    if (a == t_self) hle_thread_checkpoint();
++    /* Do not return while a guest can still resume into resources the
++     * terminating caller is about to free (POD's CRT descriptor table). */
++    while (!a->done) { hle_block_begin(); usleep(1000); hle_block_end(); }
++    RET(1, 2);
+ }
+ static void k_GetExitCodeThread(void) {        /* (h, &code) */
+     struct thread_arg *a = (struct thread_arg *)hle_handle_obj(A32(0), HLE_H_THREAD);
+@@ -535,6 +581,8 @@
+     { "RaiseException",               k_RaiseException },
+     { "LoadModule",                   k_LoadModule },
+     { "CreateThread",                 k_CreateThread },
++    { "TerminateThread",              k_TerminateThread },
++    { "SuspendThread",                k_SuspendThread },
+     { "ResumeThread",                 k_ResumeThread },
+     { "ExitThread",                   k_ExitThread },
+     { "GetExitCodeThread",            k_GetExitCodeThread },
+--- a/runtime/win32hle/pe_loader.c
++++ b/runtime/win32hle/pe_loader.c
+@@ -84,7 +84,14 @@
+     memcpy(hle_ptr(base), file, opt->SizeOfHeaders);
+     pe_section_header *sec = (pe_section_header *)((uint8_t *)&nt->OptionalHeader + nt->FileHeader.SizeOfOptionalHeader);
+     for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+-        uint32_t copy = sec[i].SizeOfRawData < sec[i].VirtualSize ? sec[i].SizeOfRawData : sec[i].VirtualSize;
++        /* Watcom leaves VirtualSize zero and gives .bss a raw size but no
++         * file offset. Match recomp32/image_loader.c's existing rules. */
++        if (!sec[i].PointerToRawData) continue;
++        uint32_t extent = sec[i].VirtualSize ? round_up(sec[i].VirtualSize, PAGE) : sec[i].SizeOfRawData;
++        uint32_t copy = sec[i].SizeOfRawData < extent ? sec[i].SizeOfRawData : extent;
++        if (sec[i].VirtualAddress >= span || copy > span - sec[i].VirtualAddress) {
++            free(file); return 1;
++        }
+         if (copy && (size_t)sec[i].PointerToRawData + copy <= flen)
+             memcpy(hle_ptr(base + sec[i].VirtualAddress), file + sec[i].PointerToRawData, copy);
+     }
+--- a/runtime/win32hle/screen.c
++++ b/runtime/win32hle/screen.c
+@@ -593,6 +593,12 @@
+         case SDL_MOUSEBUTTONDOWN: case SDL_MOUSEBUTTONUP: {
+             int gx, gy, down = e.type == SDL_MOUSEBUTTONDOWN;
+             to_game(e.button.x, e.button.y, &gx, &gy);
++            if (win32hle_trace) {
++                int ww=0,wh=0,pw=0,ph=0;
++                SDL_GetWindowSize(g_win,&ww,&wh); SDL_GetRendererOutputSize(g_ren,&pw,&ph);
++                fprintf(stderr,"[screen-input] raw=%d,%d game=%d,%d source=%dx%d window=%dx%d output=%dx%d dst=%d,%d,%d,%d\n",
++                    e.button.x,e.button.y,gx,gy,g_src_w,g_src_h,ww,wh,pw,ph,g_dst.x,g_dst.y,g_dst.w,g_dst.h);
++            }
+             uint32_t m = e.button.button == SDL_BUTTON_RIGHT ? (down ? WM_RBUTTONDOWN : WM_RBUTTONUP)
+                        : e.button.button == SDL_BUTTON_MIDDLE ? (down ? WM_MBUTTONDOWN : WM_MBUTTONUP)
+                        : (down ? WM_LBUTTONDOWN : WM_LBUTTONUP);
+@@ -614,7 +620,13 @@
+     int w, h, bpp;
+     hle_dd_mode(&w, &h, &bpp);
+     if (!g_win || g_dst.w <= 0 || w <= 0 || h <= 0) return;
+-    SDL_WarpMouseInWindow(g_win, g_dst.x + x * g_dst.w / w, g_dst.y + y * g_dst.h / h);
++    /* g_dst uses renderer pixels, while SDL mouse coordinates use window
++     * points. Invert the HiDPI transform used by to_game(). */
++    int px=g_dst.x+(int)((long long)x*g_dst.w/w),py=g_dst.y+(int)((long long)y*g_dst.h/h);
++    int ww=0,wh=0,pw=0,ph=0;
++    SDL_GetWindowSize(g_win,&ww,&wh); SDL_GetRendererOutputSize(g_ren,&pw,&ph);
++    if (ww>0 && wh>0 && pw>0 && ph>0) { px=(int)((long long)px*ww/pw); py=(int)((long long)py*wh/ph); }
++    SDL_WarpMouseInWindow(g_win,px,py);
+ }
+ 
+ /* The game drew into the primary. On the window's thread, show it (present
+@@ -630,6 +642,10 @@
+     present();
+ }
+ 
++/* Configure presentation before opening a window. Guest display timing may
++ * already be supplied by DirectDraw, independently of physical refresh. */
++static int g_present_vsync = 1;
++void hle_screen_vsync(int enabled) { g_present_vsync = enabled != 0; }
+ int hle_screen_open(const char *title, int fullscreen, int headless) {
+     g_headless = headless, g_fullscreen = fullscreen;
+     hle_set_pump_hook(hle_screen_pump);
+@@ -640,7 +656,7 @@
+     g_win = SDL_CreateWindow(title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1280, 960,
+                              SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI | (fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
+     if (!g_win) { fprintf(stderr, "[screen] window: %s\n", SDL_GetError()); return -1; }
+-    g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_PRESENTVSYNC);
++    g_ren = SDL_CreateRenderer(g_win, -1, g_present_vsync ? SDL_RENDERER_PRESENTVSYNC : 0);
+     if (!g_ren) g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_SOFTWARE);
+     if (!g_ren) { fprintf(stderr, "[screen] renderer: %s\n", SDL_GetError()); return -1; }
+     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
+--- a/runtime/win32hle/user32.c
++++ b/runtime/win32hle/user32.c
+@@ -150,6 +150,7 @@
+ static uint32_t g_focus, g_capture, g_active;
+ static int g_screen_w = 640, g_screen_h = 480;
+ static int g_cursor_x, g_cursor_y, g_cursor_shown = 0;
++static uint8_t g_recent_press[256];
+ static uint8_t g_keys[256];                      /* bit 7: down, bit 0: toggled */
+ static void (*g_pump)(void);
+ 
+@@ -197,7 +198,7 @@
+  * sender waits for the result. (A test driver's LB_SETCURSEL run on its own
+  * thread ran the game's list handler there, and the game stopped.) */
+ #define MAX_SENT 32
+-static struct { uint32_t h, m, w, l, result, thread; volatile int state; } g_sent[MAX_SENT];   /* state: 1 queued, 2 done */
++static struct { uint32_t h, m, w, l, result, thread, sender, callback, data; int asynchronous; volatile int state; } g_sent[MAX_SENT];   /* state: 1 queued, 2 done */
+ static void deliver_sent(void) {
+     uint32_t me = hle_thread_id();
+     for (int i = 0; i < MAX_SENT; i++)
+@@ -205,7 +206,7 @@
+             win_t *x = W(g_sent[i].h);
+             g_sent[i].state = 3;                         /* running */
+             g_sent[i].result = x ? call_proc(x->proc, g_sent[i].h, g_sent[i].m, g_sent[i].w, g_sent[i].l) : 0;
+-            g_sent[i].state = 2;
++            g_sent[i].state = g_sent[i].asynchronous && !g_sent[i].callback ? 0 : 2;
+         }
+ }
+ uint32_t hle_send(uint32_t h, uint32_t m, uint32_t w, uint32_t l) {
+@@ -215,6 +216,7 @@
+     int i = 0;
+     while (i < MAX_SENT && g_sent[i].state) i++;
+     if (i == MAX_SENT) return call_proc(x->proc, h, m, w, l);   /* ponytail: a full table runs it here */
++    g_sent[i].asynchronous = 0;
+     g_sent[i].h = h, g_sent[i].m = m, g_sent[i].w = w, g_sent[i].l = l, g_sent[i].thread = x->thread, g_sent[i].state = 1;
+     while (g_sent[i].state != 2) {
+         deliver_sent();                                  /* sends to this thread meanwhile, as Windows does */
+@@ -227,12 +229,54 @@
+     return r;
+ }
+ 
++/* SendMessageCallback follows the window thread for delivery and the sender
++ * thread for completion. Queue polling, not audio/OS callbacks, runs guest code.
++ * https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-sendmessagecallbacka */
++static void deliver_async_callbacks(void) {
++    uint32_t me=hle_thread_id();
++    for (int i=0;i<MAX_SENT;i++)
++        if (g_sent[i].asynchronous && g_sent[i].state==2 && g_sent[i].sender==me) {
++            uint32_t cb=g_sent[i].callback,a[4]={g_sent[i].h,g_sent[i].m,g_sent[i].data,g_sent[i].result};
++            g_sent[i].state=0; /* free before a reentrant completion callback */
++            if (cb) hle_call_guest(cb,4,a);
++        }
++}
++static int send_callback(uint32_t h,uint32_t m,uint32_t w,uint32_t l,uint32_t cb,uint32_t data) {
++    win_t *x=W(h);
++    if (!x) { hle_set_last_error(1400); return 0; }
++    if (!x->thread || x->thread==hle_thread_id()) {
++        uint32_t result=call_proc(x->proc,h,m,w,l);
++        if (cb) { uint32_t a[4]={h,m,data,result}; hle_call_guest(cb,4,a); }
++        return 1;
++    }
++    int i=0; while (i<MAX_SENT && g_sent[i].state) i++;
++    if (i==MAX_SENT) { hle_set_last_error(8); return 0; }
++    memset(&g_sent[i],0,sizeof g_sent[i]);
++    g_sent[i].h=h; g_sent[i].m=m; g_sent[i].w=w; g_sent[i].l=l;
++    g_sent[i].thread=x->thread; g_sent[i].sender=hle_thread_id();
++    g_sent[i].callback=cb; g_sent[i].data=data; g_sent[i].asynchronous=1; g_sent[i].state=1;
++    return 1;
++}
++static void u_SendMessageCallbackA(void) {
++    uint32_t h=A32(0),m=A32(1),w=A32(2),l=A32(3),cb=A32(4),data=A32(5);
++    if (h!=0xffffu) RET(send_callback(h,m,w,l,cb,data),6);
++    uint32_t windows[MAX_WIN]; int n=0;
++    for (int i=0;i<MAX_WIN;i++) if (g_win[i].used && !g_win[i].parent) windows[n++]=g_win[i].hwnd;
++    int result=1;
++    for (int i=0;i<n;i++) if (W(windows[i]) && !send_callback(windows[i],m,w,l,cb,data)) result=0;
++    RET(result,6);
++}
++
+ /* ---- the queue ---- */
+ typedef struct { uint32_t hwnd, message, wParam, lParam, time; int x, y; uint32_t thread; } msg_t;   /* thread: whose queue (0: anyone's) */
+ #define QN 1024
+ static msg_t g_q[QN];
+ static int g_qn;
+-static int g_quit; static uint32_t g_quit_code;
++/* PostQuitMessage is a low-priority flag in the calling thread's queue,
++ * not a process-global flag that a sound worker may consume.
++ * https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-postquitmessage */
++typedef struct quit_request { uint32_t thread,code; struct quit_request *next; } quit_request;
++static quit_request *g_quits;
+ 
+ /* A message is in the queue of its window's thread, as on Windows: a second
+  * thread pumping its own messages (sound.dll's, with PeekMessage(NULL)) must
+@@ -246,15 +290,33 @@
+     win_t *x = W(h == 0xFFFFu ? hle_first_hwnd() : h);   /* HWND_BROADCAST: the top-level windows, the game's */
+     q_push_to(h, m, w, l, x ? x->thread : 0);
+ }
++static void post_quit(uint32_t thread,uint32_t code) {
++    for (quit_request *q=g_quits;q;q=q->next)
++        if (q->thread==thread) { q->code=code; return; }
++    quit_request *q=malloc(sizeof *q);
++    if (!q) { q_push_to(0,WM_QUIT,code,0,thread); return; }
++    *q=(quit_request){thread,code,g_quits}; g_quits=q;
++}
++static int take_quit(uint32_t thread,uint32_t *code,int remove) {
++    quit_request **link=&g_quits;
++    while (*link && (*link)->thread!=thread) link=&(*link)->next;
++    if (!*link) return 0;
++    quit_request *q=*link; *code=q->code;
++    if (remove) { *link=q->next; free(q); }
++    return 1;
++}
+ void hle_post_message(uint32_t hwnd, uint32_t message, uint32_t wParam, uint32_t lParam) {
+-    if (message == WM_QUIT) { g_quit = 1, g_quit_code = wParam; return; }
++    if (message == WM_QUIT) {
++        win_t *x=W(hwnd?hwnd:hle_first_hwnd());
++        post_quit(x?x->thread:hle_thread_id(),wParam); return;
++    }
+     q_push(hwnd, message, wParam, lParam);
+ }
+ int hle_msg_pop(uint32_t *message, uint32_t *wParam, uint32_t *lParam) {
+-    if (!g_qn && g_quit) {                               /* WM_QUIT comes after the posted messages */
+-        g_quit = 0;
++    uint32_t quit_code;
++    if (!g_qn && take_quit(hle_thread_id(),&quit_code,1)) {
+         if (message) *message = WM_QUIT;
+-        if (wParam) *wParam = g_quit_code;
++        if (wParam) *wParam = quit_code;
+         if (lParam) *lParam = 0;
+         return 1;
+     }
+@@ -353,6 +415,7 @@
+     return hle_call_guest(fn, 3, a);
+ }
+ 
++static void activate_window(uint32_t hwnd);
+ static uint32_t create_window(uint32_t exstyle, const char *cls, const char *title, uint32_t style, int px, int py, int pw, int ph,
+                               uint32_t parent, uint32_t menu, uint32_t hinst, uint32_t param);
+ uint32_t hle_create_window(uint32_t exstyle, const char *cls, const char *title, uint32_t style, int px, int py, int pw, int ph,
+@@ -406,7 +469,7 @@
+         if (p) hle_send(p->hwnd, 0x0210u, WM_CREATE | (x->id << 16), h);   /* WM_PARENTNOTIFY */
+     }
+     if (style & WS_VISIBLE) { invalidate(x, 0); hle_send(h, WM_SHOWWINDOW, 1, 0); }
+-    if (!x->parent && !g_active && (style & WS_VISIBLE)) g_active = h;
++    if (!x->parent && !g_active && (style & WS_VISIBLE)) activate_window(h);
+     return h;
+ }
+ 
+@@ -494,6 +557,19 @@
+     if (h && W(h)) hle_send(h, WM_SETFOCUS, old, 0);
+ }
+ 
++/* A visible top-level window is activated, not just assigned as active.
++ * POD suspends its render worker until WM_ACTIVATEAPP reaches its WndProc. */
++static void activate_window(uint32_t h) {
++    if (!W(h) || g_active == h) return;
++    uint32_t old = g_active;
++    g_active = h;
++    if (old && W(old)) hle_send(old, WM_ACTIVATE, 0, h);
++    hle_send(h, WM_ACTIVATEAPP, 1, 0);
++    hle_send(h, WM_NCACTIVATE, 1, 0);
++    hle_send(h, WM_ACTIVATE, 1, old);
++    if (W(h)) set_focus(h);
++}
++
+ static void notify(win_t *x, uint32_t code) {
+     win_t *p = W(x->parent);
+     if (p) hle_send(p->hwnd, WM_COMMAND, (x->id & 0xFFFF) | (code << 16), x->hwnd);
+@@ -505,6 +581,7 @@
+ static int matches(const msg_t *m, uint32_t hwnd, uint32_t lo, uint32_t hi) {
+     if (m->message == 0xFFFFFFFFu) return 0;
+     if (m->thread && m->thread != hle_thread_id()) return 0;
++    if (m->message == WM_QUIT) return 1; /* quit bypasses message/window filters */
+     if (hwnd == 0xFFFFFFFFu) { if (m->hwnd) return 0; }
+     else if (hwnd && !(m->hwnd == hwnd || is_descendant(m->hwnd, hwnd))) return 0;
+     if (lo || hi) return m->message >= lo && m->message <= hi;
+@@ -513,6 +590,7 @@
+ 
+ static int next_message(msg_t *out, uint32_t hwnd, uint32_t lo, uint32_t hi, int remove) {
+     deliver_sent();
++    deliver_async_callbacks();
+     /* drop the dead (messages to destroyed windows) */
+     while (g_qn && g_q[0].message == 0xFFFFFFFFu) memmove(g_q, g_q + 1, sizeof g_q[0] * (size_t)--g_qn);
+     for (int i = 0; i < g_qn; i++)
+@@ -521,10 +599,10 @@
+             if (remove) memmove(g_q + i, g_q + i + 1, sizeof g_q[0] * (size_t)(--g_qn - i));
+             return 1;
+         }
+-    if (g_quit && (!(lo || hi) || (WM_QUIT >= lo && WM_QUIT <= hi))) {
++    uint32_t quit_code;
++    if (take_quit(hle_thread_id(),&quit_code,remove)) {
+         memset(out, 0, sizeof *out);
+-        out->message = WM_QUIT, out->wParam = g_quit_code, out->time = hle_ticks_ms();
+-        if (remove) g_quit = 0;
++        out->message = WM_QUIT, out->wParam = quit_code, out->time = hle_ticks_ms();
+         return 1;
+     }
+     if (!(lo || hi) || (WM_PAINT >= lo && WM_PAINT <= hi))
+@@ -598,7 +676,10 @@
+     RET(1, 0);
+ }
+ static void u_PostMessageA(void) {
+-    if (A32(1) == WM_QUIT) { g_quit = 1, g_quit_code = A32(2); RET(1, 4); }
++    if (A32(1) == WM_QUIT) {
++        win_t *x=W(A32(0));
++        post_quit(x?x->thread:hle_thread_id(),A32(2)); RET(1,4);
++    }
+     if (!A32(0)) { q_push_to(0, A32(1), A32(2), A32(3), hle_thread_id()); RET(1, 4); }   /* NULL: this thread's own queue */
+     q_push(A32(0), A32(1), A32(2), A32(3));
+     RET(1, 4);
+@@ -621,7 +702,7 @@
+         hle_block_begin(); usleep(1000); hle_block_end();
+     }
+ }
+-static void u_PostQuitMessage(void) { g_quit = 1, g_quit_code = A32(0); RETV(1); }
++static void u_PostQuitMessage(void) { post_quit(hle_thread_id(),A32(0)); RETV(1); }
+ static void u_SendMessageA(void) { RET(hle_send(A32(0), A32(1), A32(2), A32(3)), 4); }
+ static void u_CallWindowProcA(void) { RET(call_proc(A32(0), A32(1), A32(2), A32(3), A32(4)), 5); }
+ 
+@@ -707,12 +788,23 @@
+     return (g_keys[0x01] & 0x80 ? 1u : 0u) | (g_keys[0x02] & 0x80 ? 2u : 0u) | (g_keys[VK_SHIFT] & 0x80 ? 4u : 0u) |
+            (g_keys[VK_CONTROL] & 0x80 ? 8u : 0u) | (g_keys[0x04] & 0x80 ? 0x10u : 0u);
+ }
++/* GetKeyState's toggle bit is distinct from GetAsyncKeyState's recent
++ * press bit. Ordinary arrows/buttons must return to zero after release.
++ * https://learn.microsoft.com/windows/win32/api/winuser/nf-winuser-getkeystate */
++static void update_key(uint32_t vk,int down) {
++    uint8_t old=g_keys[vk],toggle=old&1;
++    if (down && !(old&0x80)) {
++        g_recent_press[vk]=1;
++        if (vk==0x14 || vk==0x90 || vk==0x91) toggle^=1;
++    }
++    g_keys[vk]=(uint8_t)((down?0x80:0)|toggle);
++}
+ void hle_input_mouse(uint32_t message, int sx, int sy) {
+     g_cursor_x = sx, g_cursor_y = sy;
+     uint32_t vk = message == WM_LBUTTONDOWN || message == WM_LBUTTONUP ? 1 : message == WM_RBUTTONDOWN || message == WM_RBUTTONUP ? 2
+                 : message == WM_MBUTTONDOWN || message == WM_MBUTTONUP ? 4 : 0;
+     int down = message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN || message == WM_MBUTTONDOWN;
+-    if (vk) g_keys[vk] = down ? (uint8_t)(0x80 | ((g_keys[vk] & 1) ^ 1)) : (uint8_t)(g_keys[vk] & 1);
++    if (vk) update_key(vk,down);
+     int cx, cy;
+     uint32_t t;
+     if (g_capture && W(g_capture)) {
+@@ -727,18 +819,21 @@
+ }
+ void hle_input_key(int down, uint32_t vk, uint32_t scan) {
+     vk &= 0xFF;
+-    if (down) g_keys[vk] = (uint8_t)(0x80 | ((g_keys[vk] & 1) ^ !(g_keys[vk] & 0x80)));
+-    else g_keys[vk] &= 1;
++    int was_down=(g_keys[vk]&0x80)!=0;
++    update_key(vk,down);
+     if (vk == 0xA0 || vk == 0xA1) { if (down) g_keys[VK_SHIFT] |= 0x80; else g_keys[VK_SHIFT] &= 1; }
+     if (vk == 0xA2 || vk == 0xA3) { if (down) g_keys[VK_CONTROL] |= 0x80; else g_keys[VK_CONTROL] &= 1; }
+     if (vk == 0xA4 || vk == 0xA5) { if (down) g_keys[VK_MENU] |= 0x80; else g_keys[VK_MENU] &= 1; }
+     uint32_t t = hle_focus_window();
+     int alt = (g_keys[VK_MENU] & 0x80) != 0;
+-    uint32_t l = 1u | (scan & 0xFFu) << 16 | (alt ? 1u << 29 : 0) | (down ? 0 : 3u << 30);
++    int extended=(scan&0x100) || (vk>=0x21 && vk<=0x28) || vk==0x2d || vk==0x2e ||
++                 vk==0xa3 || vk==0xa5 || vk==0x5b || vk==0x5c || vk==0x6f;
++    uint32_t l = 1u | (scan & 0xFFu) << 16 | (extended?1u<<24:0) |
++                 (alt?1u<<29:0) | (was_down || !down?1u<<30:0) | (!down?1u<<31:0);
+     if (t) q_push(t, alt || vk == VK_MENU || vk == 0x79 ? (down ? WM_SYSKEYDOWN : WM_SYSKEYUP) : (down ? WM_KEYDOWN : WM_KEYUP), vk, l);
+ }
+ void hle_input_cursor(int sx, int sy) { g_cursor_x = sx, g_cursor_y = sy; }
+-void hle_input_key_state(uint32_t vk, int down) { if (down) g_keys[vk & 0xFF] |= 0x80; else g_keys[vk & 0xFF] &= 1; }
++void hle_input_key_state(uint32_t vk, int down) { update_key(vk&0xff,down); }
+ 
+ /* ---- DefWindowProc ---- */
+ static uint32_t def_proc(uint32_t h, uint32_t m, uint32_t w, uint32_t l) {
+@@ -1378,7 +1473,7 @@
+     while ((d = W(h)) && !d->dlg_ended) {
+         msg_t m;
+         if (!wait_message(&m, 0, 0, 0)) break;
+-        if (m.message == WM_QUIT) { g_quit = 1, g_quit_code = m.wParam; break; }
++        if (m.message == WM_QUIT) { post_quit(hle_thread_id(),m.wParam); break; }
+         if (!is_dialog_message(h, &m)) {
+             uint32_t mm[7] = { m.hwnd, m.message, m.wParam, m.lParam, m.time, (uint32_t)m.x, (uint32_t)m.y };
+             win_t *t = W(m.hwnd);
+@@ -1633,6 +1728,22 @@
+     default: return i >= 0 && i / 4 < 32 ? x->extra[i / 4] : 0;
+     }
+ }
++static void u_SetClassLongA(void) {
++    win_t *x = W(A32(0));
++    if (!x) { hle_set_last_error(1400); RET(0, 3); }
++    int index = (int)A32(1); uint32_t value = A32(2), old;
++    uint32_t *field = NULL;
++    if (index == -12) field = &g_cls[x->cls].cursor;
++    else if (index == -26) field = &g_cls[x->cls].style;
++    else if (index == -16) field = &g_cls[x->cls].hinst;
++    else if (index == -24) field = &g_cls[x->cls].proc;
++    if (!field) { hle_set_last_error(1413); RET(0, 3); }
++    old = *field; *field = value;
++    if (index == -24) for (int i = 0; i < MAX_WIN; i++)
++        if (g_win[i].used && g_win[i].cls == x->cls && g_win[i].proc == old)
++            g_win[i].proc = value;
++    RET(old, 3);
++}
+ static void u_GetWindowLongA(void) { win_t *x = W(A32(0)); RET(x ? get_long(x, (int)A32(1)) : 0u, 2); }
+ static void u_SetWindowLongA(void) {
+     win_t *x = W(A32(0));
+@@ -1852,8 +1963,8 @@
+ static void u_GetCapture(void) { RET(g_capture, 0); }
+ static void u_GetActiveWindow(void) { RET(g_active, 0); }
+ static void u_GetForegroundWindow(void) { RET(g_active, 0); }
+-static void u_SetActiveWindow(void) { uint32_t old = g_active; if (W(A32(0))) g_active = A32(0); RET(old, 1); }
+-static void u_SetForegroundWindow(void) { if (W(A32(0))) g_active = A32(0); RET(1, 1); }
++static void u_SetActiveWindow(void) { uint32_t old = g_active; activate_window(A32(0)); RET(old, 1); }
++static void u_SetForegroundWindow(void) { uint32_t h = A32(0); activate_window(h); RET(W(h) != NULL, 1); }
+ static void u_GetDesktopWindow(void) { RET(0x0000FFF0u, 0); }
+ 
+ /* timers */
+@@ -1887,7 +1998,8 @@
+ }
+ static void u_GetAsyncKeyState(void) {
+     if ((A32(0) & 0xFF) == 1) hle_lbutton_reads++;
+-    RET(g_keys[A32(0) & 0xFF] & 0x80 ? 0x8000u : 0u, 1);
++    uint32_t vk=A32(0)&0xff,result=(g_keys[vk]&0x80?0x8000u:0u)|g_recent_press[vk];
++    g_recent_press[vk]=0; RET(result,1);
+ }
+ static void u_GetKeyboardState(void) { memcpy(APTR(0), g_keys, 256); RET(1, 1); }
+ static void u_GetCursorPos(void) { if (A32(0)) MEM32(A32(0)) = (uint32_t)g_cursor_x, MEM32(A32(0) + 4) = (uint32_t)g_cursor_y; RET(1, 1); }
+@@ -2285,7 +2397,9 @@
+ 
+ /* What is waiting in the queue, for a test driver's report. */
+ void hle_queue_dump(void) {
+-    fprintf(stderr, "[user32] %d queued, quit %d, focus %05X capture %05X active %05X\n", g_qn, g_quit, g_focus, g_capture, g_active);
++    fprintf(stderr, "[user32] %d queued, focus %05X capture %05X active %05X\n", g_qn, g_focus, g_capture, g_active);
++    for (quit_request *q=g_quits;q;q=q->next)
++        fprintf(stderr,"  quit thread=%u code=%u\n",q->thread,q->code);
+     for (int i = 0; i < g_qn && i < 16; i++)
+         fprintf(stderr, "  %05X %s#%u <- %04X %08X %08X\n", g_q[i].hwnd, W(g_q[i].hwnd) ? g_cls[W(g_q[i].hwnd)->cls].name : "?",
+                 W(g_q[i].hwnd) ? W(g_q[i].hwnd)->id : 0, g_q[i].message, g_q[i].wParam, g_q[i].lParam);
+@@ -2346,6 +2460,7 @@
+     { "SetWindowPos", u_SetWindowPos }, { "MoveWindow", u_MoveWindow },
+     { "BeginDeferWindowPos", u_BeginDeferWindowPos }, { "DeferWindowPos", u_DeferWindowPos },
+     { "EndDeferWindowPos", u_EndDeferWindowPos },
++    { "SetClassLongA", u_SetClassLongA },
+     { "SetWindowLongA", u_SetWindowLongA }, { "GetWindowLongA", u_GetWindowLongA },
+     { "GetWindowContextHelpId", u_GetWindowContextHelpId }, { "GetMenu", u_GetMenu },
+     { "GetSystemMetrics", u_GetSystemMetrics }, { "GetClientRect", u_GetClientRect },
+@@ -2368,7 +2483,7 @@
+     { "PostThreadMessageA", u_PostThreadMessageA }, { "MsgWaitForMultipleObjects", u_MsgWaitForMultipleObjects },
+     { "GetMessageA", u_GetMessageA }, { "PeekMessageA", u_PeekMessageA }, { "WaitMessage", u_WaitMessage },
+     { "TranslateMessage", u_TranslateMessage }, { "DispatchMessageA", u_DispatchMessageA },
+-    { "SendMessageA", u_SendMessageA },
++    { "SendMessageA", u_SendMessageA }, { "SendMessageCallbackA", u_SendMessageCallbackA },
+     { "CreateDialogParamA", u_CreateDialogParamA }, { "CreateDialogIndirectParamA", u_CreateDialogIndirectParamA },
+     { "DialogBoxParamA", u_DialogBoxParamA }, { "DialogBoxIndirectParamA", u_DialogBoxIndirectParamA },
+     { "EndDialog", u_EndDialog }, { "IsDialogMessageA", u_IsDialogMessageA }, { "IsDialogMessage", u_IsDialogMessageA },
+--- a/runtime/win32hle/win32hle.h
++++ b/runtime/win32hle/win32hle.h
+@@ -225,6 +225,7 @@
+ extern void (*hle_on_exit)(int code);              /* run by ExitProcess before the process goes */
+ void  hle_exit(int code);                          /* flush and leave, once */
+ uint32_t hle_thread_id(void);                      /* GetCurrentThreadId's answer for this thread */
++void  hle_thread_checkpoint(void);                 /* imports/back-edges: cooperative termination */
+ int   hle_thread_done(uint32_t h);                 /* a CreateThread handle's thread has ended */
+ uint32_t hle_thread_id_new(void);                  /* an id for a thread about to start (CreateThread's) */
+ void     hle_thread_id_adopt(uint32_t tid);        /* that thread, first thing: this is its id */
+@@ -287,6 +288,7 @@
+ void hle_dd_mode(int *w, int *h, int *bpp);
+ extern void (*hle_dd_primary_hook)(void);            /* the primary's pixels or palette changed (a blit, an Unlock, a Flip) */
+ int  hle_dd_surface_pixels(uint32_t obj, uint8_t **px, int *w, int *h, int *pitch, int *bpp);   /* 0: not a surface */
++void hle_dd_primary_touched(void);                  /* host/API interop changed primary pixels */
+ void hle_dsound_set_master(float gain);              /* 0 mutes */
+ void hle_dsound_register_com(void);                  /* CoCreateInstance(CLSID_DirectSound) (recomp_host_init) */
+ /* A host's own sound (a movie's), mixed with the game's buffers: interleaved
+@@ -301,6 +303,7 @@
+ extern const win32hle_shim win32hle_bink[];           /* binkw32 on ffmpeg (bink.c; stubs without HLE_WITH_FFMPEG) */
+ /* The SDL2 display and input for a DirectDraw game (screen.c): installs
+  * itself as the pump hook. headless: no window (a script drives input). */
++void hle_screen_vsync(int enabled); /* before screen_open; default enabled */
+ int  hle_screen_open(const char *title, int fullscreen, int headless);
+ void hle_screen_pump(void);
+ extern int (*hle_screen_key_hook)(int sdl_scancode, int down);   /* nonzero: the host took the key */

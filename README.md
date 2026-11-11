@@ -27,6 +27,13 @@ its `lift32` writes the C, and its `native32` runtime hosts it.
 
 ## Status
 
+The Windows release status below is retained from upstream. This fork also
+has an experimental **native ARM64/macOS host**, with SDL effects, lifted
+Indeo playback and CUE-based CD music. See [the native guide](docs/MACOS_NATIVE.md)
+for build instructions, verification evidence and remaining limitations.
+[Module ownership](docs/FRONTEND_ARCHITECTURE.md) tracks preparation for a
+future Libretro frontend and the dependencies still to isolate.
+
 **v0.1.0.** It runs, untouched, from boot through the menus to a race of your own and
 back. Install it with the [installer](https://github.com/sp00nznet/pod-recomp/releases/latest)
 (recomp-launcher: point it at your disc, **Build**, **Play**) or with `Setup.cmd` below.
@@ -66,6 +73,10 @@ From headless runs (`--record`): the intro, the main menu, and POD's attract-mod
 ![Your own race on Beltane](docs/screenshots/your-race.png)
 
 ## Getting Started
+
+For the experimental native ARM64/macOS host, see
+[the native prototype guide](docs/MACOS_NATIVE.md). Its verified scope and
+media/input limitations are separate from the Windows results below.
 
 You need **your own POD Gold disc**: the CD, or an image of it (`POD2_0.BIN` + `.CUE`,
 or an ISO). The CD's data track is copied into `game\`; nothing is downloaded but tools.

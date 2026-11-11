@@ -1,5 +1,17 @@
 # Roadmap
 
+## Native macOS fork
+
+The ARM64 host supports effects, lifted Indeo playback and music from the
+two-file POD Gold CUE. Eight synthetic tests, bounded native checks, the
+game's Quit route and a relocated bundle with external content paths have
+been verified. DirectDraw owns the virtual display clock, including headless
+runs. See [the native guide](docs/MACOS_NATIVE.md) for evidence and limits.
+Remaining native qualification includes full-game/movie timing, physical
+controls and listening, general mouse/menu navigation, extended play, Finder
+setup and a clean-machine run. The upstream host tasks below retain their
+own scope; Linux and Libretro ports have not been started.
+
 ## Next
 
 - **Score a race of your own in conformance.** It plays (v0.1.0, by hand-written `--key`

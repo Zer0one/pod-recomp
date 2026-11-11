@@ -12,6 +12,12 @@ cmake_minimum_required(VERSION 3.20)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 project(pod C)
 
+if(NOT WIN32)
+  enable_testing()
+  add_subdirectory(src/portable)
+  return()
+endif()
+
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
   message(FATAL_ERROR "the host must be 32-bit: use build.cmd (vcvarsall amd64_x86)")
 endif()
